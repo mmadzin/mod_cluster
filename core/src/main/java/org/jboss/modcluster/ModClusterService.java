@@ -42,8 +42,10 @@ import javax.servlet.http.HttpSessionListener;
 import org.jboss.modcluster.advertise.AdvertiseListener;
 import org.jboss.modcluster.advertise.AdvertiseListenerFactory;
 import org.jboss.modcluster.advertise.impl.AdvertiseListenerFactoryImpl;
+import org.jboss.modcluster.config.AdvertiseConfiguration;
 import org.jboss.modcluster.config.BalancerConfiguration;
 import org.jboss.modcluster.config.MCMPHandlerConfiguration;
+import org.jboss.modcluster.config.ModClusterConfiguration;
 import org.jboss.modcluster.config.NodeConfiguration;
 import org.jboss.modcluster.config.impl.ModClusterConfig;
 import org.jboss.modcluster.container.Connector;
@@ -76,6 +78,7 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
     private final NodeConfiguration nodeConfig;
     private final BalancerConfiguration balancerConfig;
     private final MCMPHandlerConfiguration mcmpConfig;
+    private final AdvertiseConfiguration advertiseConfig;
     private final MCMPHandler mcmpHandler;
     private final ResetRequestSource resetRequestSource;
     private final MCMPRequestFactory requestFactory;
@@ -83,7 +86,7 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
     private final AdvertiseListenerFactory listenerFactory;
     private final LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory;
 
-    private final Map<Host, Set<String>> excludedContexts = new HashMap<Host, Set<String>>();
+    private final Map<String, Set<String>> excludedContexts = new HashMap<String, Set<String>>();
     private final ConcurrentMap<Context, EnablableRequestListener> requestListeners = new ConcurrentHashMap<Context, EnablableRequestListener>();
 
     private volatile boolean established = false;
@@ -93,34 +96,41 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
     private volatile LoadBalanceFactorProvider loadBalanceFactorProvider;
     private volatile AdvertiseListener advertiseListener;
 
+    public ModClusterService(ModClusterConfiguration config, LoadBalanceFactorProvider loadBalanceFactorProvider) {
+        this(config.getNodeConfiguration(), config.getBalancerConfiguration(), config.getMCMPHandlerConfiguration(), config.getAdvertiseConfiguration(), new SimpleLoadBalanceFactorProviderFactory(loadBalanceFactorProvider));
+    }
+
     public ModClusterService(ModClusterConfig config, LoadBalanceFactorProvider loadBalanceFactorProvider) {
         this(config, new SimpleLoadBalanceFactorProviderFactory(loadBalanceFactorProvider));
     }
 
     public ModClusterService(ModClusterConfig config, LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory) {
-        this(config, loadBalanceFactorProviderFactory, new DefaultMCMPRequestFactory());
+        this(config, config, config, config, loadBalanceFactorProviderFactory);
     }
 
-    private ModClusterService(ModClusterConfig config, LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory,
-            MCMPRequestFactory requestFactory) {
-        this(config, loadBalanceFactorProviderFactory, requestFactory, new DefaultMCMPResponseParser(),
-                new ResetRequestSourceImpl(config, config, requestFactory));
+    private ModClusterService(NodeConfiguration nodeConfig, BalancerConfiguration balancerConfig, MCMPHandlerConfiguration mcmpConfig, AdvertiseConfiguration advertiseConfig,
+                              LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory) {
+        this(nodeConfig, balancerConfig, mcmpConfig, advertiseConfig, loadBalanceFactorProviderFactory, new DefaultMCMPRequestFactory());
     }
 
-    private ModClusterService(ModClusterConfig config, LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory,
-            MCMPRequestFactory requestFactory, MCMPResponseParser responseParser, ResetRequestSource resetRequestSource) {
-        this(config, config, config, loadBalanceFactorProviderFactory, requestFactory, responseParser, resetRequestSource,
-                new DefaultMCMPHandler(config, resetRequestSource, requestFactory, responseParser),
-                new AdvertiseListenerFactoryImpl());
+    private ModClusterService(NodeConfiguration nodeConfig, BalancerConfiguration balancerConfig, MCMPHandlerConfiguration mcmpConfig, AdvertiseConfiguration advertiseConfig,
+                              LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory, MCMPRequestFactory requestFactory) {
+        this(nodeConfig, balancerConfig, mcmpConfig, advertiseConfig, loadBalanceFactorProviderFactory, requestFactory,
+                new DefaultMCMPResponseParser(), new ResetRequestSourceImpl(nodeConfig, balancerConfig, requestFactory));
     }
 
-    protected ModClusterService(NodeConfiguration nodeConfig, BalancerConfiguration balancerConfig,
-            MCMPHandlerConfiguration mcmpConfig, LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory,
-            MCMPRequestFactory requestFactory, MCMPResponseParser responseParser, ResetRequestSource resetRequestSource,
-            MCMPHandler mcmpHandler, AdvertiseListenerFactory listenerFactory) {
+    private ModClusterService(NodeConfiguration nodeConfig, BalancerConfiguration balancerConfig, MCMPHandlerConfiguration mcmpConfig, AdvertiseConfiguration advertiseConfig,
+                              LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory, MCMPRequestFactory requestFactory, MCMPResponseParser responseParser, ResetRequestSource resetRequestSource) {
+        this(nodeConfig, balancerConfig, mcmpConfig, advertiseConfig, loadBalanceFactorProviderFactory, requestFactory, responseParser, resetRequestSource,
+                new DefaultMCMPHandler(mcmpConfig, resetRequestSource, requestFactory, responseParser), new AdvertiseListenerFactoryImpl());
+    }
+
+    protected ModClusterService(NodeConfiguration nodeConfig, BalancerConfiguration balancerConfig, MCMPHandlerConfiguration mcmpConfig, AdvertiseConfiguration advertiseConfig,
+                                LoadBalanceFactorProviderFactory loadBalanceFactorProviderFactory, MCMPRequestFactory requestFactory, MCMPResponseParser responseParser, ResetRequestSource resetRequestSource, MCMPHandler mcmpHandler, AdvertiseListenerFactory listenerFactory) {
         this.nodeConfig = nodeConfig;
         this.balancerConfig = balancerConfig;
         this.mcmpConfig = mcmpConfig;
+        this.advertiseConfig = advertiseConfig;
         this.mcmpHandler = mcmpHandler;
         this.resetRequestSource = resetRequestSource;
         this.requestFactory = requestFactory;
@@ -142,28 +152,9 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
         this.mcmpHandler.init(this.mcmpConfig.getProxyConfigurations(), this);
 
         this.autoEnableContexts = this.mcmpConfig.isAutoEnableContexts();
+
         this.excludedContexts.clear();
-
-        Map<String, Set<String>> excludedContextPaths = this.mcmpConfig.getExcludedContextsPerHost();
-
-        if (!excludedContextPaths.isEmpty()) {
-            for (Engine engine : server.getEngines()) {
-                for (Host host : engine.getHosts()) {
-                    Set<String> excluded = new HashSet<String>();
-                    Set<String> paths = excludedContextPaths.get(host.getName());
-                    if (paths != null) {
-                        excluded.addAll(paths);
-                    }
-                    paths = excludedContextPaths.get(null);
-                    if (paths != null) {
-                        excluded.addAll(paths);
-                    }
-                    if (!excluded.isEmpty()) {
-                        this.excludedContexts.put(host, Collections.unmodifiableSet(excluded));
-                    }
-                }
-            }
-        }
+        this.excludedContexts.putAll(this.mcmpConfig.getExcludedContextsPerHost());
 
         this.resetRequestSource.init(server, this);
 
@@ -171,9 +162,9 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
 
         Boolean advertise = this.mcmpConfig.getAdvertise();
 
-        if (Boolean.TRUE.equals(advertise) || (advertise == null && this.mcmpConfig.getProxies().isEmpty())) {
+        if (Boolean.TRUE.equals(advertise) || (advertise == null && this.mcmpConfig.getProxyConfigurations().isEmpty())) {
             try {
-                this.advertiseListener = this.listenerFactory.createListener(this.mcmpHandler, this.mcmpConfig);
+                this.advertiseListener = this.listenerFactory.createListener(this.mcmpHandler, this.advertiseConfig);
 
                 this.advertiseListener.start();
             } catch (IOException e) {
@@ -188,8 +179,17 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
      * @see org.jboss.modcluster.mcmp.ContextFilter#getExcludedContexts()
      */
     @Override
-    public Map<Host, Set<String>> getExcludedContexts() {
-        return Collections.unmodifiableMap(this.excludedContexts);
+    public Set<String> getExcludedContexts(Host host) {
+        Set<String> excluded = new HashSet<String>();
+        Set<String> paths = this.excludedContexts.get(null);
+        if (paths != null) {
+            excluded.addAll(paths);
+        }
+        paths = this.excludedContexts.get(host.getName());
+        if (paths != null) {
+            excluded.addAll(paths);
+        }
+        return Collections.unmodifiableSet(excluded);
     }
 
     /**
@@ -466,9 +466,7 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
     }
 
     private boolean include(Context context) {
-        Set<String> excludedPaths = this.excludedContexts.get(context.getHost());
-
-        return (excludedPaths == null) || !excludedPaths.contains(context.getPath());
+        return !this.getExcludedContexts(context.getHost()).contains(context.getPath());
     }
 
     /**
@@ -693,12 +691,13 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
 
         long start = System.currentTimeMillis();
         long end = start + unit.toMillis(timeout);
+        boolean success = true;
 
         for (Engine engine : this.server.getEngines()) {
             for (Host host : engine.getHosts()) {
                 for (Context context : host.getContexts()) {
                     if (this.mcmpConfig.getSessionDrainingStrategy().isEnabled(context) && !this.drainSessions(context, start, end)) {
-                        return false;
+                        success = false;
                     }
                 }
             }
@@ -709,7 +708,7 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
             this.mcmpHandler.sendRequest(this.requestFactory.createStopRequest(engine));
         }
 
-        return true;
+        return success;
     }
 
     /**
@@ -735,9 +734,7 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
             success = this.drainSessions(context, start, start + unit.toMillis(timeout));
         }
 
-        if (success) {
-            this.mcmpHandler.sendRequest(this.requestFactory.createStopRequest(context));
-        }
+        this.mcmpHandler.sendRequest(this.requestFactory.createStopRequest(context));
 
         return success;
     }
@@ -837,6 +834,7 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
 
                 long current = System.currentTimeMillis();
                 long timeout = end - current;
+                long pollInterval = TimeUnit.SECONDS.toMillis(1);
 
                 remainingSessions = context.getActiveSessionCount();
 
@@ -845,7 +843,7 @@ public class ModClusterService implements ModClusterServiceMBean, ContainerEvent
 
                     // Poll active sessions every second since since right after the notify, the session manager implementation
                     // will still account for that last session.
-                    listener.wait(noTimeout ? 0 : Math.min(timeout, 1000));
+                    listener.wait(noTimeout ? pollInterval : Math.min(timeout, pollInterval));
 
                     current = System.currentTimeMillis();
                     timeout = end - current;
